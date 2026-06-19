@@ -1,0 +1,76 @@
+# .github/workflows/rebase-staging.yml
+# Approach A — the one repair ritual: rebase staging onto main + force-push.
+# Used after a hotfix (Case A3b) or a partial release (Case A7).
+# Trigger: manual button. Gated by the same environment reviewers (it force-pushes).
+name: Rebase staging onto main
+
+on:
+  workflow_dispatch:        # manual button — always available
+  push:
+    branches: [main]        # auto-trigger on hotfix pushes: queues a run that WAITS at the
+                            # environment gate (reviewers get notified) — "the system
+                            # remembers, a human confirms." No unattended force-push.
+
+permissions: {}
+
+concurrency:
+  group: rebase-staging
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    # Skip pushes made by the release bot: ff-releases leave staging identical (no repair
+    # needed), and release-* releases are repaired by the chained job in release.yml.
+    if: github.event_name == 'workflow_dispatch' || github.actor != 'trave-release-bot'
+    runs-on: ubuntu-latest
+    environment: production-release
+    steps:
+      - name: Checkout staging (full history, bot credentials)
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "trave-release-bot"
+          git config user.email "release-bot@trave.example"
+
+      - name: Rebase staging onto main
+        run: |
+          git fetch origin main
+          # Free path first: if staging hasn't moved, this is a plain fast-forward
+          # (no force-push, no SHA changes, nothing for anyone to re-sync).
+          if git merge --ff-only origin/main 2>/dev/null; then
+            echo "MODE=ff" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # Otherwise replay unreleased commits on top of main.
+          # Duplicate patches (hotfix already cherry-picked, dropped commits from a
+          # partial release) are detected by patch-id and silently skipped.
+          if ! git rebase origin/main; then
+            echo "::error::Rebase conflict — the hotfix touched the same lines as unreleased work."
+            echo "::error::This needs human judgment. Resolve locally:"
+            echo "::error::  git checkout staging && git rebase origin/main   # fix conflicts"
+            echo "::error::  git push --force-with-lease origin staging"
+            exit 1
+          fi
+          echo "MODE=rebase" >> "$GITHUB_ENV"
+
+      - name: Push staging
+        run: |
+          # --force-with-lease aborts if someone merged to staging mid-run (race-safe).
+          git push --force-with-lease origin staging
+
+      - name: Summary / reminder
+        run: |
+          if [ "$MODE" = "ff" ]; then
+            echo "## staging fast-forwarded to main — no force-push, nothing to announce." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## staging rebased onto main (force-pushed)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Announce in Slack: anyone with a local staging checkout runs \`git pull --rebase\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+        # Optional: replace the manual announcement with a Slack webhook step, e.g.
+        # - uses: slackapi/slack-github-action@v2
+        #   with: { webhook: '${{ secrets.SLACK_WEBHOOK }}', payload: '{"text":"staging rebased — git pull --rebase"}' }

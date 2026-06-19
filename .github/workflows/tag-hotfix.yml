@@ -1,0 +1,55 @@
+# .github/workflows/tag-hotfix.yml
+# Approach A — derives the next vYYYY-MM-DD-hfN tag automatically when a hotfix
+# lands on main. No human tags anything at 2am.
+# Release pushes are excluded by actor: the release workflow tags itself, and its
+# pushes come from the bot account.
+name: Tag hotfix
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: tag-hotfix
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    # Skip pushes made by the release bot (those are ff-releases, already tagged).
+    if: github.actor != 'trave-release-bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (full history, bot credentials)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # Separate repo-level secret (TAG_BOT_TOKEN): this workflow deliberately has no
+          # environment gate (hotfix tags must not wait for approval), so it can't read the
+          # environment-scoped RELEASE_BOT_TOKEN. A PAT (not GITHUB_TOKEN) is required so
+          # the tag push triggers the prod deploy workflow.
+          token: ${{ secrets.TAG_BOT_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "trave-release-bot"
+          git config user.email "release-bot@trave.example"
+
+      - name: Derive and push next hotfix tag
+        run: |
+          git fetch origin --tags
+          # Most recent release tag reachable from main, e.g. v2026-06-04
+          LAST=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -z "$LAST" ]; then
+            # No tags yet (pre-adoption edge case): anchor on today's date.
+            LAST="v$(date -u +%Y-%m-%d)"
+          fi
+          # Strip any existing -hfN so hf2 follows hf1 on the same base.
+          BASE="${LAST%-hf*}"
+          N=$(git tag -l "${BASE}-hf*" | wc -l | tr -d ' ')
+          TAG="${BASE}-hf$((N+1))"
+          git tag -a "$TAG" -m "Hotfix $TAG"
+          git push origin "refs/tags/$TAG"
+          echo "## Tagged \`$TAG\` — tag push triggers the prod deploy." >> "$GITHUB_STEP_SUMMARY"

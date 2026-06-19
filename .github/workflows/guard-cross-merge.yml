@@ -1,0 +1,69 @@
+name: Guard staging/main merges
+
+# Keeps PRs between staging and main (either direction) unmergeable from the
+# GitHub UI by forcing them into DRAFT state - a draft PR has no merge button,
+# and `gh pr merge` refuses it too. If someone clicks "Ready for review", the
+# ready_for_review trigger immediately re-drafts it. The job also exits 1 so
+# the PR shows a red X explaining why.
+#
+# This is deliberately NOT a required status check: a required check would also
+# block direct pushes to main/staging, and Phase 1 wants everyone able to push
+# (the /gitflow:release ff push and /gitflow:repair-staging force-push run from
+# any dev's machine).
+#
+# These PRs are landed via the Claude git-flow commands instead:
+#   - staging -> main: /gitflow:release (fast-forward push, PR is review-only)
+#   - main -> staging: /gitflow:repair-staging (rebase + force-with-lease, no PR at all)
+# All other PRs (feature-*/fix-* -> staging, hot-fix-* -> main) are untouched.
+
+on:
+  pull_request:
+    # "edited" catches base retargeting; "ready_for_review" re-drafts escape attempts.
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    branches: [main, staging]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  guard-cross-merge:
+    name: guard-cross-merge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep staging<->main PRs in draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          case "$BASE:$HEAD" in
+            main:staging|main:staging-*)
+              REASON="Release PRs (staging -> main) are review-only. Land the release with /gitflow:release (fast-forward push), not the merge button."
+              ;;
+            staging:main)
+              REASON="main -> staging is never merged via PR. Run /gitflow:repair-staging (rebase staging onto main + force-with-lease) instead."
+              ;;
+            *)
+              echo "PR $HEAD -> $BASE is not a staging<->main pair; nothing to do."
+              exit 0
+              ;;
+          esac
+
+          if [ "$IS_DRAFT" != "true" ]; then
+            gh api graphql \
+              -f query='mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }' \
+              -f id="$PR_NODE_ID"
+            echo "Converted $PR_URL back to draft."
+          fi
+
+          # Explain once when the PR opens or someone tries to mark it ready.
+          if [ "$EVENT_ACTION" = "opened" ] || [ "$EVENT_ACTION" = "ready_for_review" ]; then
+            gh pr comment "$PR_URL" --body "This PR is kept in **draft** on purpose: $REASON"
+          fi
+
+          echo "::error::$REASON"
+          exit 1

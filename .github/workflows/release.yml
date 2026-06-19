@@ -1,0 +1,107 @@
+# .github/workflows/release.yml
+# Approach A — Thursday release: fast-forward staging (or a release-* branch) into main, then tag.
+# Trigger: manual button (Actions tab). Gated by the `production-release` environment reviewers.
+name: Release (staging → main)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Branch to release: 'staging' (normal week) or 'release-YYYY-MM-DD' (partial release, Case A6)"
+        required: true
+        default: staging
+        type: string
+
+# We push with the bot PAT, not GITHUB_TOKEN — drop all default permissions.
+permissions: {}
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production-release   # ← required reviewers approve here before any step runs
+    steps:
+      - name: Checkout main (full history, bot credentials)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "trave-release-bot"
+          git config user.email "release-bot@trave.example"
+
+      - name: Fast-forward main to ${{ inputs.source }}
+        run: |
+          git fetch origin "${{ inputs.source }}"
+          # --ff-only is self-verifying: if main has diverged (unrepaired hotfix,
+          # stray commit), this FAILS loudly instead of creating a merge commit.
+          if ! git merge --ff-only "origin/${{ inputs.source }}"; then
+            echo "::error::main is not an ancestor of ${{ inputs.source }}."
+            echo "::error::Run the 'Rebase staging onto main' workflow first (Case A3b/A7), then retry."
+            exit 1
+          fi
+
+      - name: Create release tag (vYYYY-MM-DD, suffix if same-day re-release)
+        run: |
+          git fetch origin --tags
+          BASE="v$(date -u +%Y-%m-%d)"
+          TAG="$BASE"
+          N=2
+          while git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; do
+            TAG="${BASE}.${N}"; N=$((N+1))
+          done
+          git tag -a "$TAG" -m "Weekly release $TAG (source: ${{ inputs.source }})"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Push main + tag (tag push triggers the prod deploy)
+        run: git push origin main "refs/tags/$TAG"
+
+      - name: Summary
+        run: |
+          echo "## Released \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "main fast-forwarded to \`${{ inputs.source }}\` — identical SHAs, no new commits created." >> "$GITHUB_STEP_SUMMARY"
+
+  # When releasing from a release-* branch (QA fixes and/or dropped commits — Cases A6/A7),
+  # main now contains commits staging doesn't (or twins of staging's). The ff invariant is
+  # broken the moment the release lands, so the repair runs in the SAME approved transaction.
+  # Releasing from 'staging' itself needs no sync: the ff leaves both branches identical.
+  # The per-run environment approval covers this job too — no second approval prompt.
+  sync-staging:
+    if: inputs.source != 'staging'
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production-release
+    steps:
+      - name: Checkout staging (full history, bot credentials)
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "trave-release-bot"
+          git config user.email "release-bot@trave.example"
+
+      - name: Rebase staging onto main (drops twins by patch-id)
+        run: |
+          git fetch origin main
+          if git merge --ff-only origin/main 2>/dev/null; then
+            echo "staging fast-forwarded — no force-push needed."
+            exit 0
+          fi
+          if ! git rebase origin/main; then
+            echo "::error::Rebase conflict (likely a conflict-modified dropped/QA-fix commit — Case A7 caveat)."
+            echo "::error::Resolve locally: git rebase origin/main, drop the conflicting twin via rebase -i if needed,"
+            echo "::error::then git push --force-with-lease origin staging."
+            exit 1
+          fi
+          git push --force-with-lease origin staging
+          echo "## staging rebased onto main after release-* release — announce: \`git pull --rebase\`" >> "$GITHUB_STEP_SUMMARY"
