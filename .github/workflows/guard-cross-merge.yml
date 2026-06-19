@@ -32,7 +32,12 @@ jobs:
     steps:
       - name: Keep staging<->main PRs in draft
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The default GITHUB_TOKEN cannot run convertPullRequestToDraft
+          # (GitHub forbids that mutation for app/installation tokens), so this
+          # uses a PAT with pull-requests:write. Create a fine-grained PAT with
+          # "Pull requests: Read and write" on this repo and store it as the
+          # GUARD_PAT secret.
+          GH_TOKEN: ${{ secrets.GUARD_PAT }}
           BASE: ${{ github.base_ref }}
           HEAD: ${{ github.head_ref }}
           PR_NODE_ID: ${{ github.event.pull_request.node_id }}
