@@ -4,16 +4,21 @@ GitHub does not read rulesets from the repo; these JSON files are the source of 
 kept in version control, and they must be applied to the repo settings manually (via
 `gh api` or Settings -> Rules -> Rulesets -> New ruleset -> Import a ruleset).
 
-## Design: minimal — enforce linear history, nothing else
+## Design: enforce linear history AND require a reviewed PR
 
-This repo is the testbed for the gitflow slash-command workflow (`/gitflow:*`). The one
-invariant the rulesets enforce is **linear history**: `main` and `staging` are a single
-forward-only line, releases are fast-forwards, and there are no merge commits. The
-rulesets are deliberately kept to only the rules that serve that invariant — no
-require-a-PR rule, no required status checks. Either of those would block the direct
-fast-forward push to `main` (`/gitflow:release`) and the force-with-lease push to
-`staging` (`/gitflow:repair-staging`) for everyone without bypass rights, which fights the
-Phase 1 "everyone runs the commands locally" design.
+This repo is the testbed for the gitflow slash-command workflow (`/gitflow:*`). The
+rulesets enforce two things: **linear history** (`main` and `staging` are a single
+forward-only line, no merge commits) and **a pull request before anything lands** on
+either branch (squash-only merge method). `main` requires 1 approving review; `staging`
+requires none, so a staging PR can be self-merged without waiting on a reviewer.
+
+There are no bypass actors, so the rules apply to everyone, including admins. That makes
+this the *enforced* posture (closer to the Notion doc's Phase 2 than the loose Phase 1):
+because `pull_request` forbids direct pushes, the two commands that push directly -
+`/gitflow:release` (fast-forward push to `main`) and `/gitflow:repair-staging`
+(force-with-lease push to `staging`) - are blocked as written. To run those locally you
+must add a bypass actor (an admin role, or a release bot for real Phase 2); without one,
+`main` only advances through an approved squash PR. See "Effect on the slash commands".
 
 ## Rule-by-rule
 
@@ -22,38 +27,45 @@ can't carry inline comments. The one-sentence explanation of every rule lives he
 
 ### main.json
 
-- `deletion` - blocks deleting the `main` branch (trunk-protection safety net, not a linear-history rule, but cheap to keep).
+- `deletion` - blocks deleting the `main` branch (trunk-protection safety net).
 - `required_linear_history` - rejects any push that would add a merge commit, so main stays one straight line.
-- `non_fast_forward` - blocks force-pushes and history rewrites on main, while still allowing the fast-forward release push.
-- `bypass_actors` (admin, `actor_id: 5`) - lets repo admins override the rules in an emergency; the normal flow never needs it.
+- `non_fast_forward` - blocks force-pushes and history rewrites on main, while still allowing a fast-forward update.
+- `pull_request` (1 approval, `allowed_merge_methods: [squash]`) - changes must arrive through a PR with at least one approving review, merged by squash; no direct pushes.
+- `bypass_actors: []` - empty, so nobody bypasses; the rules above bind admins too.
 
 ### staging.json
 
 - `deletion` - blocks deleting the `staging` branch (trunk-protection safety net).
 - `required_linear_history` - rejects merge commits on staging so it stays linear (squash-from-feature and rebase-from-repair both qualify).
-- (no `non_fast_forward`) - intentionally omitted so `/gitflow:repair-staging` can rebase staging onto main and force-push it (`--force-with-lease` is the safety net); the result is still linear.
-- `bypass_actors` (admin, `actor_id: 5`) - emergency override only.
+- `pull_request` (0 approvals, `allowed_merge_methods: [squash]`) - requires a squash PR but no approving review, so a staging PR can be self-merged; still blocks direct pushes.
+- (no `non_fast_forward`) - omitted so a rebased staging *could* be force-pushed, but note the `pull_request` rule still blocks direct pushes without a bypass actor.
+- `bypass_actors: []` - empty; no one bypasses.
 
-With this minimal set no bypass is needed for the day-to-day flow - the ff push and the
-force-push both satisfy the rules. The admin bypass actor is kept only as an escape hatch.
+## Effect on the slash commands
+
+With `pull_request` active and no bypass actor, the direct-push commands cannot push:
+
+- `/gitflow:release` fast-forwards `main` with a direct push - **blocked**; `main` would
+  instead have to advance by merging the staging->main PR, which contradicts the
+  fast-forward-only design.
+- `/gitflow:repair-staging` force-pushes `staging` - **blocked** for the same reason.
+- `/gitflow:ship-to-staging` lands through a squash PR to `staging`, which needs no
+  approval, so it merges without waiting on a reviewer. `/gitflow:hotfix` targets `main`,
+  so its squash PR still needs 1 approval.
+
+To keep `release`/`repair-staging` working, add a `bypass_actors` entry (admin role
+`{ "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }`, or a release
+bot) to both files and re-apply.
 
 ## Differences from other setups
 
-**vs. the live demo rulesets (what's currently applied on GitHub):** these files are
-trimmed down. Compared to live, they DROP, on `main`: the `pull_request` rule (1 approval,
-squash-only merge method) and the `required_status_checks` rule (`guard-cross-merge`); and
-on `staging`: `required_status_checks` (`guard-cross-merge`). The retained rules
-(`deletion`, `required_linear_history`, and `non_fast_forward` on main) are identical to
-live. Until the live rulesets are re-applied from these files, GitHub still enforces the
-richer live set.
-
-**vs. trave-platform's committed rulesets:** trave keeps linear history by convention +
-squash-only merge settings, not by a ruleset rule, so its `main` ruleset is
-`deletion` + `non_fast_forward` and its `staging` ruleset is `deletion` only - neither has
-`required_linear_history`. So relative to trave these files ADD `required_linear_history`
-to both branches (enforcing the invariant at the ruleset level); `deletion` and
-`non_fast_forward` on main match. Net: trave's `main` and ours share `deletion` +
-`non_fast_forward`; trave's `staging` and ours share `deletion`.
+**vs. trave-platform:** trave's committed rulesets keep linear history by convention +
+squash-only merge settings, so its `main` is `deletion` + `non_fast_forward` and its
+`staging` is `deletion` only. Trave's *live* `PR Force` ruleset adds `deletion` +
+`non_fast_forward` + `pull_request` on the default branch (`main`) only - and it is
+currently **disabled**, never enforced, and never applied to `staging`. So relative to
+trave, these files enforce more: `required_linear_history` and `pull_request` on **both**
+branches, actively.
 
 ## staging<->main UI merges are blocked separately
 
